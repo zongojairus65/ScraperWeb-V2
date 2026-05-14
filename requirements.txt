@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+mistralai
+beautifulsoup4
+requests
+apscheduler
+reportlab
+python-dotenv
+pydantic
