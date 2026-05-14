@@ -1,9 +1,9 @@
-fastapi
+API rapide
 uvicorn
-mistralai
+mistralai>=1.0.0
 beautifulsoup4
-requests
+demandes
 apscheduler
-reportlab
+laboratoire de rapports
 python-dotenv
-pydantic
+pydantique
