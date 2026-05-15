@@ -1,9 +1,10 @@
 fastapi
 uvicorn
-mistral
+mistralai
 beautifulsoup4
 requests
 apscheduler
 reportlab
 python-dotenv
 pydantic
+aiosqlite
