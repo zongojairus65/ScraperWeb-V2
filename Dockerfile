@@ -1,5 +1,4 @@
 FROM python:3.11-slim
-# cache-bust: 2026-05-14
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -11,7 +10,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && \
+# Cache-bust : change cette date à chaque fois que tu veux forcer reinstall
+RUN echo "2026-05-15" && pip install --upgrade pip && \
     pip install -r requirements.txt
 
 COPY . .
