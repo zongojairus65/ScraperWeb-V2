@@ -11,7 +11,7 @@ from typing import List
 import aiosqlite
 import requests as http_requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger, CronTriggerError
+from apscheduler.triggers.cron import CronTrigger
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -385,7 +385,7 @@ async def create_schedule(request: ScheduleRequest):
     # Fix #7 — validation du cron avant l'insertion en DB ; 400 propre si invalide
     try:
         trigger = CronTrigger.from_crontab(request.cron)
-    except (ValueError, CronTriggerError) as e:
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Expression cron invalide : {e}")
 
     async with aiosqlite.connect(DB_PATH) as db:
