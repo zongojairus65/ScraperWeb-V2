@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+mistralai>=1.0.0,<2.0.0
+google-genai>=0.3.0
+beautifulsoup4
+requests
+apscheduler
+reportlab
+python-dotenv
+pydantic
+aiosqlite
+playwright
