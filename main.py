@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from google import genai
+from google.genai import types as genai_types
 from mistralai import Mistral
 from playwright.async_api import async_playwright
 from pydantic import BaseModel
@@ -381,9 +382,9 @@ async def scrape_single(url: str, prompt: str, mode: str = "simple") -> dict:
 
 # ─── Agent navigateur autonome (nouveau) ──────────────────────────────────────
 #
-# Boucle :  screenshot -> Pixtral decide -> Playwright execute -> recommence
+# Boucle :  screenshot -> Gemini (vision) decide -> Playwright execute -> recommence
 # Arret :   action "extract" ou max_steps atteint
-# Modele :  pixtral-large-latest (vision) pour les decisions
+# Modele :  Gemini Flash Lite -> Gemma 4 (open-source) pour les decisions vision
 #           Gemini -> Gemma 4 (open-source) -> Magistral pour l'analyse finale
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -412,7 +413,7 @@ Regles :
 - Si apres plusieurs tentatives le clic echoue toujours, essaie de cliquer sur le score ou le statut du match (ex: "FT", "3 - 0") qui est souvent cliquable aussi"""
 
 
-def decide_action_with_mistral(
+def decide_action_with_gemini(
     screenshot_b64: str,
     intent: str,
     url: str,
@@ -421,10 +422,16 @@ def decide_action_with_mistral(
     history: list
 ) -> dict:
     """
-    Appelle Pixtral avec le screenshot courant pour obtenir la prochaine action.
+    Appelle Gemini (vision) avec le screenshot courant pour obtenir la prochaine action.
+    Remplace Pixtral/Mistral : gratuit, meme client 'genai' deja utilise pour l'analyse
+    texte, et evite une dependance API payante supplementaire.
+
+    Essaie Gemini Flash Lite d'abord (le plus rapide), puis Gemma 4 (open source)
+    en secours si le premier echoue ou est rate-limite.
+
     Synchrone — exécuté dans le thread executor.
     """
-    client = get_mistral_client()
+    client = get_gemini_client()
     prompt = AGENT_DECISION_PROMPT.format(
         intent=intent,
         url=url,
@@ -432,22 +439,25 @@ def decide_action_with_mistral(
         max_steps=max_steps,
         history=json.dumps(history, ensure_ascii=False) if history else "aucune action encore"
     )
-    response = client.chat.complete(
-        model="pixtral-large-latest",
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}
-                },
-                {"type": "text", "text": prompt}
-            ]
-        }]
-    )
-    raw = extract_text_from_content(response.choices[0].message.content).strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    image_bytes = base64.b64decode(screenshot_b64)
+    image_part = genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+
+    errors = []
+    for model_name in (GEMINI_LITE_MODEL, GEMMA_MODEL):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[image_part, prompt],
+            )
+            raw = (response.text or "").strip()
+            if not raw:
+                raise ValueError("Reponse vide")
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            return json.loads(raw)
+        except Exception as e:
+            errors.append(f"{model_name}: {e}")
+
+    raise RuntimeError("Echec de la decision agent (vision) : " + " | ".join(errors))
 
 
 async def execute_action(page, action: dict) -> str:
@@ -549,11 +559,11 @@ async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> di
             screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
             current_url = page.url
 
-            # 2. Pixtral decide la prochaine action
+            # 2. Gemini (vision) decide la prochaine action
             try:
                 action = await loop.run_in_executor(
                     executor,
-                    decide_action_with_mistral,
+                    decide_action_with_gemini,
                     screenshot_b64, intent, current_url, step, max_steps, history
                 )
             except Exception as e:
@@ -569,7 +579,7 @@ async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> di
                     try:
                         action = await loop.run_in_executor(
                             executor,
-                            decide_action_with_mistral,
+                            decide_action_with_gemini,
                             screenshot_b64, intent, current_url, step, max_steps, history
                         )
                     except Exception as e2:
