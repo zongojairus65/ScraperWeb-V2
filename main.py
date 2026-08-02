@@ -24,7 +24,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from google import genai
 from google.genai import types as genai_types
 from mistralai import Mistral
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Route
 from pydantic import BaseModel
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -36,13 +36,24 @@ load_dotenv()
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 DB_PATH = "scraper.db"
-executor = ThreadPoolExecutor(max_workers=5)
+executor = ThreadPoolExecutor(max_workers=8)
 scheduler = AsyncIOScheduler()
 
 GEMINI_LITE_MODEL = "models/gemini-flash-lite-latest"
 GEMINI_MODEL = "models/gemini-flash-latest"
 GEMMA_MODEL = "gemma-4-26b-a4b-it"
 MAGISTRAL_MODEL = "magistral-medium-latest"
+
+# ── Réglages perf agent navigateur (OPTIM) ──
+# Avant : wait_until="networkidle" partout -> beaucoup de sites (trackers,
+# polling live-score, ads) ne deviennent JAMAIS "idle", donc Playwright
+# attendait systématiquement le timeout complet à chaque étape.
+# Après : "domcontentloaded" + attente courte explicite, nettement plus fiable
+# et rapide dans ce contexte (agent multi-étapes).
+NAV_TIMEOUT_MS = 15000
+POST_NAV_SETTLE_MS = 600
+CLICK_STRATEGY_TIMEOUT_MS = 2500
+DEFAULT_MAX_STEPS = 8  # avant : 12
 
 _mistral_client: Mistral | None = None
 _gemini_client: "genai.Client | None" = None
@@ -90,89 +101,108 @@ def assert_public_url(url: str) -> None:
         ):
             raise ValueError(f"URL refusee : adresse non autorisee ({ip})")
 
-# ─── Base de données SQLite (async) ───────────────────────────────────────────
+# ─── Base de données SQLite (async, connexion persistante) ────────────────────
+# OPTIM : une seule connexion aiosqlite ouverte au demarrage de l'app et
+# reutilisee partout, au lieu d'ouvrir/fermer une connexion a chaque requete.
+# aiosqlite serialise en interne les requetes sur une connexion via son thread
+# dedie, donc c'est sans risque en usage concurrent (bulk scraping, etc.).
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS scrape_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT NOT NULL,
-                prompt TEXT NOT NULL,
-                result TEXT,
-                status TEXT DEFAULT 'success',
-                mode TEXT DEFAULT 'simple',
-                model TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS scheduled_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                url TEXT NOT NULL,
-                prompt TEXT NOT NULL,
-                cron TEXT NOT NULL,
-                mode TEXT DEFAULT 'simple',
-                active INTEGER DEFAULT 1,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        # Migration retrocompatible : ajout colonnes si absentes
-        async def add_column_if_missing(table: str, column: str, coltype: str):
-            async with db.execute(f"PRAGMA table_info({table})") as cursor:
-                cols = [row[1] for row in await cursor.fetchall()]
-            if column not in cols:
-                await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+async def init_db(db: aiosqlite.Connection):
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS scrape_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            result TEXT,
+            status TEXT DEFAULT 'success',
+            mode TEXT DEFAULT 'simple',
+            model TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            cron TEXT NOT NULL,
+            mode TEXT DEFAULT 'simple',
+            active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
 
-        await add_column_if_missing("scrape_history", "mode", "TEXT DEFAULT 'simple'")
-        await add_column_if_missing("scrape_history", "model", "TEXT")
-        await add_column_if_missing("scheduled_jobs", "mode", "TEXT DEFAULT 'simple'")
-        await db.commit()
+    async def add_column_if_missing(table: str, column: str, coltype: str):
+        async with db.execute(f"PRAGMA table_info({table})") as cursor:
+            cols = [row[1] for row in await cursor.fetchall()]
+        if column not in cols:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+    await add_column_if_missing("scrape_history", "mode", "TEXT DEFAULT 'simple'")
+    await add_column_if_missing("scrape_history", "model", "TEXT")
+    await add_column_if_missing("scheduled_jobs", "mode", "TEXT DEFAULT 'simple'")
+    await db.commit()
 
 async def save_to_history(
+    db: aiosqlite.Connection,
     url: str, prompt: str, result: str,
     status: str = "success", mode: str = "simple", model: str = ""
 ) -> int:
-    # `result` est deja une chaine de texte (reponse du LLM ou message d'erreur).
-    # On ne ré-encode plus en JSON pour eviter le double-encodage.
     if not isinstance(result, str):
         result = json.dumps(result, ensure_ascii=False)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        cursor = await db.execute(
-            "INSERT INTO scrape_history (url, prompt, result, status, mode, model) VALUES (?, ?, ?, ?, ?, ?)",
-            (url, prompt, result, status, mode, model)
-        )
-        row_id = cursor.lastrowid
-        await db.commit()
+    cursor = await db.execute(
+        "INSERT INTO scrape_history (url, prompt, result, status, mode, model) VALUES (?, ?, ?, ?, ?, ?)",
+        (url, prompt, result, status, mode, model)
+    )
+    row_id = cursor.lastrowid
+    await db.commit()
     return row_id
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
+# OPTIM : le navigateur Chromium et le driver Playwright sont demarres UNE
+# SEULE FOIS ici et reutilises pour toutes les requetes (via app.state.browser).
+# Avant : chaque requete relancait tout Chromium (cold start ~1-3s a chaque
+# fois), en plus d'etre gaspilleur en ressources sous charge.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    db = await aiosqlite.connect(DB_PATH)
+    app.state.db = db
+    await init_db(db)
+
     get_mistral_client()
+
+    playwright_ctx = await async_playwright().start()
+    app.state.playwright = playwright_ctx
+    app.state.browser = await playwright_ctx.chromium.launch(
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled"]
+    )
+
     scheduler.start()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, name, url, prompt, cron, mode FROM scheduled_jobs WHERE active=1"
-        ) as cursor:
-            jobs = await cursor.fetchall()
+    async with db.execute(
+        "SELECT id, name, url, prompt, cron, mode FROM scheduled_jobs WHERE active=1"
+    ) as cursor:
+        jobs = await cursor.fetchall()
     for job in jobs:
         job_id, name, url, prompt, cron, mode = job
         scheduler.add_job(
             scheduled_scrape,
             CronTrigger.from_crontab(cron),
-            args=[url, prompt, mode or "simple"],
+            args=[app, url, prompt, mode or "simple"],
             id=f"job_{job_id}",
             name=name,
             replace_existing=True
         )
+
     yield
+
     scheduler.shutdown(wait=False)
+    await app.state.browser.close()
+    await playwright_ctx.stop()
+    await db.close()
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -182,7 +212,7 @@ API_KEY = os.getenv("API_KEY")
 app = FastAPI(
     title="ScraperWeb V2 API",
     description="API de web scraping IA — Mistral + SQLite + Export + Planification + Agent navigateur",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -209,6 +239,53 @@ async def api_key_middleware(request: Request, call_next):
                 )
     return await call_next(request)
 
+# ─── Blocage de ressources (OPTIM) ─────────────────────────────────────────────
+# Bloquer polices/medias (et images pour le mode "simple", sans vision) allege
+# chaque page et reduit le trafic reseau residuel qui retardait les attentes.
+# Pour l'agent (vision), on garde les images car Gemini regarde le screenshot.
+
+async def _block_route(route: Route, block_images: bool):
+    rtype = route.request.resource_type
+    blocked_types = {"media", "font"}
+    if block_images:
+        blocked_types.add("image")
+    if rtype in blocked_types:
+        await route.abort()
+    else:
+        await route.continue_()
+
+async def new_hardened_page(browser, *, block_images: bool, viewport: dict | None = None):
+    context = await browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        viewport=viewport or {"width": 1280, "height": 800}
+    )
+    page = await context.new_page()
+    await page.route("**/*", functools.partial(_block_route, block_images=block_images))
+    return context, page
+
+async def dismiss_cookie_banner(page):
+    for sel in [
+        "button:has-text('Accept all')", "button:has-text('Tout accepter')",
+        "button:has-text('Accept')", "button:has-text('Accepter')",
+    ]:
+        try:
+            await page.click(sel, timeout=1200)
+            break
+        except Exception:
+            pass
+
+async def settle(page):
+    """Attente courte et bornee, remplace les wait_for_load_state('networkidle')."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=4000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(POST_NAV_SETTLE_MS)
+
 # ─── Scraping HTTP — mode simple (inchange) ───────────────────────────────────
 
 def fetch_page_content(url: str) -> str:
@@ -219,7 +296,6 @@ def fetch_page_content(url: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; ScraperWebBot/2.0)"}
     response = http_requests.get(url, headers=headers, timeout=15, allow_redirects=True)
     response.raise_for_status()
-    # Verifie l'URL finale apres redirections eventuelles
     assert_public_url(response.url)
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header"]):
@@ -227,35 +303,23 @@ def fetch_page_content(url: str) -> str:
     return soup.get_text(separator="\n", strip=True)[:12000]
 
 # ─── Scraping navigateur — mode browser (URL connue) ─────────────────────────
+# OPTIM : reutilise le navigateur persistant (app.state.browser), plus de
+# chromium.launch() par requete. domcontentloaded + attente courte au lieu
+# de networkidle. Images bloquees (pas de vision necessaire ici).
 
-async def fetch_page_browser(url: str) -> str:
-    """Recupere le contenu d'une URL precise via Playwright headless."""
+async def fetch_page_browser(app: FastAPI, url: str) -> str:
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
     assert_public_url(url)
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
-        page = await context.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        for sel in [
-            "button:has-text('Accept all')", "button:has-text('Tout accepter')",
-            "button:has-text('Accept')", "button:has-text('Accepter')",
-        ]:
-            try:
-                await page.click(sel, timeout=1500)
-                break
-            except Exception:
-                pass
-        await page.wait_for_load_state("networkidle")
+    browser = app.state.browser
+    context, page = await new_hardened_page(browser, block_images=True)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await dismiss_cookie_banner(page)
+        await settle(page)
         content = await page.content()
-        await browser.close()
+    finally:
+        await context.close()
     soup = BeautifulSoup(content, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
@@ -313,7 +377,6 @@ Reponds de maniere precise et structuree en te basant uniquement sur le contenu 
 
     errors = []
 
-    # ─── 1. Gemini Flash Lite (principal) ───
     try:
         client = get_gemini_client()
         response = client.models.generate_content(
@@ -327,7 +390,6 @@ Reponds de maniere precise et structuree en te basant uniquement sur le contenu 
     except Exception as e:
         errors.append(f"Gemini Flash Lite: {e}")
 
-    # ─── 2. Gemini Flash (fallback) ───
     try:
         client = get_gemini_client()
         response = client.models.generate_content(
@@ -341,7 +403,6 @@ Reponds de maniere precise et structuree en te basant uniquement sur le contenu 
     except Exception as e:
         errors.append(f"Gemini: {e}")
 
-    # ─── 3. Gemma 4 (open-source, via API Gemini) ───
     try:
         client = get_gemini_client()
         response = client.models.generate_content(
@@ -355,7 +416,6 @@ Reponds de maniere precise et structuree en te basant uniquement sur le contenu 
     except Exception as e:
         errors.append(f"Gemma: {e}")
 
-    # ─── 4. Magistral (Mistral) — fallback final ───
     try:
         client = get_mistral_client()
         messages = [{"role": "user", "content": user_message}]
@@ -369,21 +429,21 @@ Reponds de maniere precise et structuree en te basant uniquement sur le contenu 
 
 # ─── Scraping unifie simple + browser ────────────────────────────────────────
 
-async def scrape_single(url: str, prompt: str, mode: str = "simple") -> dict:
+async def scrape_single(app: FastAPI, url: str, prompt: str, mode: str = "simple") -> dict:
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
     loop = asyncio.get_running_loop()
     if mode == "browser":
-        content = await fetch_page_browser(url)
+        content = await fetch_page_browser(app, url)
     else:
         content = await loop.run_in_executor(executor, fetch_page_content, url)
     answer, model_used = await loop.run_in_executor(executor, run_llm, content, prompt)
     return {"url": url, "prompt": prompt, "answer": answer, "mode": mode, "model": model_used}
 
-# ─── Agent navigateur autonome (nouveau) ──────────────────────────────────────
+# ─── Agent navigateur autonome ─────────────────────────────────────────────────
 #
 # Boucle :  screenshot -> Gemini (vision) decide -> Playwright execute -> recommence
-# Arret :   action "extract" ou max_steps atteint
+# Arret :   action "extract", max_steps atteint, ou 2 echecs consecutifs sans progression
 # Modele :  Gemini Flash Lite -> Gemma 4 (open-source) pour les decisions vision
 #           Gemini -> Gemma 4 (open-source) -> Magistral pour l'analyse finale
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,12 +483,8 @@ def decide_action_with_gemini(
 ) -> dict:
     """
     Appelle Gemini (vision) avec le screenshot courant pour obtenir la prochaine action.
-    Remplace Pixtral/Mistral : gratuit, meme client 'genai' deja utilise pour l'analyse
-    texte, et evite une dependance API payante supplementaire.
-
     Essaie Gemini Flash Lite d'abord (le plus rapide), puis Gemma 4 (open source)
     en secours si le premier echoue ou est rate-limite.
-
     Synchrone — exécuté dans le thread executor.
     """
     client = get_gemini_client()
@@ -460,106 +516,112 @@ def decide_action_with_gemini(
     raise RuntimeError("Echec de la decision agent (vision) : " + " | ".join(errors))
 
 
+async def _try_click(page, locator_factory, timeout_ms: int) -> None:
+    await locator_factory().click(timeout=timeout_ms)
+
+
 async def execute_action(page, action: dict) -> str:
     """
     Execute une action Playwright.
-    Tente plusieurs strategies pour le clic afin d'etre robuste
-    face a des structures HTML variees selon les sites.
+
+    OPTIM click : les strategies sont lancees EN CONCURRENCE (asyncio.wait /
+    FIRST_COMPLETED) au lieu d'etre essayees en serie. Avant : jusqu'a 5
+    strategies x 3-4s de timeout chacune (~16s pire cas). Apres : borne au
+    timeout de la strategie la plus lente qui reussit (~2.5s pire cas typique).
     """
     action_type = action.get("type")
 
     if action_type == "click":
         text = action.get("text", "")
-        last_error = None
-        strategies = [
-            lambda: page.get_by_text(text, exact=False).first.click(timeout=4000),
-            lambda: page.get_by_role("link", name=text, exact=False).first.click(timeout=3000),
-            lambda: page.get_by_placeholder(text, exact=False).first.click(timeout=3000),
-            lambda: page.locator(f"text={text}").first.click(timeout=3000),
-            # Si le texte complet (ex: "Argentina vs Iceland") n'est pas un noeud unique,
-            # tente de cliquer sur le conteneur parent du premier mot trouve.
-            lambda: page.get_by_text(text.split()[0], exact=False).first.locator(
-                "xpath=ancestor::*[self::a or self::div or self::tr][1]"
-            ).click(timeout=3000),
+        strategy_factories = [
+            lambda: page.get_by_text(text, exact=False).first,
+            lambda: page.get_by_role("link", name=text, exact=False).first,
+            lambda: page.locator(f"text={text}").first,
         ]
-        for strategy in strategies:
-            try:
-                await strategy()
-                last_error = None
-                break
-            except Exception as e:
-                last_error = e
-        if last_error is not None:
-            raise last_error
+
+        tasks = [
+            asyncio.create_task(_try_click(page, factory, CLICK_STRATEGY_TIMEOUT_MS))
+            for factory in strategy_factories
+        ]
+        succeeded = False
+        last_error = None
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=(CLICK_STRATEGY_TIMEOUT_MS / 1000) + 0.5,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            # Cherche une tache reussie parmi celles deja terminees ; si aucune,
+            # laisse une chance aux autres taches encore en vol de finir avant
+            # de conclure a un echec total.
+            while True:
+                for t in done:
+                    if t.exception() is None:
+                        succeeded = True
+                    else:
+                        last_error = t.exception()
+                if succeeded or not pending:
+                    break
+                done, pending = await asyncio.wait(
+                    pending, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    break
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+        if not succeeded:
+            raise last_error or RuntimeError(f"Aucune strategie de clic n'a fonctionne pour '{text}'")
+
+        await settle(page)
         return f"Clique sur '{text}'"
 
     elif action_type == "type":
         text = action.get("text", "")
-        await page.keyboard.type(text, delay=50)  # delai humain anti-detection
+        await page.keyboard.type(text, delay=30)
         await page.keyboard.press("Enter")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
+        await settle(page)
         return f"Saisi '{text}' + Entree"
 
     elif action_type == "scroll":
         await page.evaluate("window.scrollBy(0, 600)")
-        await asyncio.sleep(1.5)
+        await page.wait_for_timeout(500)
         return "Scroll de 600px vers le bas"
 
     return f"Action non reconnue : {action_type}"
 
 
-async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> dict:
+async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: int = DEFAULT_MAX_STEPS) -> dict:
     """
-    Agent navigateur autonome piloté par Mistral Vision.
+    Agent navigateur autonome piloté par Gemini Vision.
 
-    Prend en entree une intention en langage naturel et un site de depart.
-    Navigue de lui-meme, etape par etape, jusqu'a trouver et extraire le contenu.
-    Aucune URL cible ni ID numerique requis.
+    OPTIM :
+    - navigateur persistant (app.state.browser), plus de chromium.launch() ici
+    - domcontentloaded + attente courte au lieu de networkidle partout
+    - arret anticipe si 2 echecs consecutifs sans progression (meme URL)
     """
     base_url = source if source.startswith("http") else f"https://{source}"
     loop = asyncio.get_running_loop()
-    history = []    # contexte JSON pour Pixtral
-    steps_log = []  # journal lisible pour la reponse API
+    history = []
+    steps_log = []
+    consecutive_failures = 0
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800}
-        )
-        page = await context.new_page()
-        await page.goto(base_url, wait_until="networkidle", timeout=30000)
+    browser = app.state.browser
+    context, page = await new_hardened_page(browser, block_images=False, viewport={"width": 1280, "height": 800})
 
-        # Gestion popup cookies au demarrage
-        for sel in [
-            "button:has-text('Accept all')", "button:has-text('Tout accepter')",
-            "button:has-text('Accept')", "button:has-text('Accepter')",
-        ]:
-            try:
-                await page.click(sel, timeout=1500)
-                break
-            except Exception:
-                pass
+    try:
+        await page.goto(base_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await dismiss_cookie_banner(page)
+        await settle(page)
 
         for step in range(1, max_steps + 1):
 
-            # 1. Screenshot de l'etat actuel
             screenshot_bytes = await page.screenshot(type="jpeg", quality=75, full_page=False)
             screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
             current_url = page.url
 
-            # 2. Gemini (vision) decide la prochaine action
             try:
                 action = await loop.run_in_executor(
                     executor,
@@ -568,14 +630,12 @@ async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> di
                 )
             except Exception as e:
                 err_str = str(e)
-                # Sur rate limit (429) ou erreur transitoire, on retente avec backoff
-                # plutot que d'abandonner immediatement une navigation presque aboutie.
                 if "429" in err_str or "rate" in err_str.lower():
                     steps_log.append({
                         "step": step, "url": current_url,
                         "error": f"Decision LLM rate-limitee, nouvelle tentative : {err_str}"
                     })
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
                     try:
                         action = await loop.run_in_executor(
                             executor,
@@ -591,8 +651,6 @@ async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> di
 
             log_entry = {"step": step, "action": action, "url": current_url}
 
-            # Anti-extraction prematuree : si la derniere action etait un clic
-            # qui a echoue, on force une nouvelle tentative au lieu d'accepter "extract".
             last_step_failed_click = (
                 history
                 and history[-1].get("type") == "click"
@@ -603,12 +661,10 @@ async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> di
                 log_entry["action"] = action
                 log_entry["note"] = "extract refuse : le clic precedent a echoue, scroll force a la place"
 
-            # 3. Extract = contenu pret, on arrete
             if action.get("type") == "extract":
                 log_entry["result"] = "Contenu extrait"
                 steps_log.append(log_entry)
                 content = await page.content()
-                await browser.close()
                 soup = BeautifulSoup(content, "html.parser")
                 for tag in soup(["script", "style", "nav", "footer", "header"]):
                     tag.decompose()
@@ -619,13 +675,13 @@ async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> di
                     "content": soup.get_text(separator="\n", strip=True)[:12000]
                 }
 
-            # 4. Executer l'action
             try:
                 description = await execute_action(page, action)
                 log_entry["result"] = description
+                consecutive_failures = 0
             except Exception as e:
                 log_entry["error"] = str(e)
-                # On continue : Pixtral verra l'etat reel au prochain screenshot
+                consecutive_failures += 1
 
             steps_log.append(log_entry)
             history_entry = {"step": step, **action}
@@ -635,12 +691,19 @@ async def run_browser_agent(intent: str, source: str, max_steps: int = 12) -> di
                 history_entry["result"] = log_entry["result"]
             history.append(history_entry)
 
-        # Sortie sans "extract" explicite (max_steps atteint ou erreur de decision
-        # apres retry). On considere quand meme un succes partiel si la page a
-        # navigue au-dela de l'URL de depart (ex: page de stats atteinte).
+            # OPTIM : arret anticipe si 2 echecs consecutifs sans progression,
+            # au lieu de consommer tout le budget max_steps inutilement.
+            if consecutive_failures >= 2:
+                steps_log.append({
+                    "step": step, "url": page.url,
+                    "note": "Arret anticipe : 2 echecs consecutifs sans progression"
+                })
+                break
+
         final_url = page.url
         content = await page.content()
-        await browser.close()
+    finally:
+        await context.close()
 
     soup = BeautifulSoup(content, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header"]):
@@ -675,10 +738,10 @@ class ScheduleRequest(BaseModel):
     mode: Literal["simple", "browser"] = "simple"
 
 class AgentSearchRequest(BaseModel):
-    intent: str      # intention en langage naturel ("Stats PSG vs Barca 7 mai 2025")
-    source: str      # site de depart ("sofascore.com")
-    prompt: str      # question Mistral sur le contenu extrait
-    max_steps: int = 12
+    intent: str
+    source: str
+    prompt: str
+    max_steps: int = DEFAULT_MAX_STEPS
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -706,35 +769,38 @@ async def health_check():
 
 @app.get("/scrape")
 async def scrape(
+    request: Request,
     url: str = Query(..., description="URL a scraper"),
     prompt: str = Query(..., description="Question sur la page"),
     mode: Literal["simple", "browser"] = Query(
         "simple", description="simple = HTTP | browser = Playwright URL connue"
     )
 ):
+    app_ = request.app
     try:
-        result = await scrape_single(url, prompt, mode)
-        history_id = await save_to_history(url, prompt, result["answer"], mode=mode, model=result.get("model", ""))
+        result = await scrape_single(app_, url, prompt, mode)
+        history_id = await save_to_history(app_.state.db, url, prompt, result["answer"], mode=mode, model=result.get("model", ""))
         return {"status": "success", "id": history_id, **result}
     except Exception as e:
-        await save_to_history(url, prompt, str(e), status="error", mode=mode)
+        await save_to_history(app_.state.db, url, prompt, str(e), status="error", mode=mode)
         raise HTTPException(status_code=500, detail=f"Erreur : {str(e)}")
 
 # ── Scraping en masse ──
 
 @app.post("/scrape/bulk")
-async def scrape_bulk(request: BulkScrapeRequest):
+async def scrape_bulk(request: BulkScrapeRequest, http_request: Request):
+    app_ = http_request.app
     results = []
     errors = []
 
     async def scrape_one(url):
         try:
-            result = await scrape_single(url, request.prompt, request.mode)
-            hid = await save_to_history(url, request.prompt, result["answer"], mode=request.mode, model=result.get("model", ""))
+            result = await scrape_single(app_, url, request.prompt, request.mode)
+            hid = await save_to_history(app_.state.db, url, request.prompt, result["answer"], mode=request.mode, model=result.get("model", ""))
             results.append({"id": hid, **result})
         except Exception as e:
             errors.append({"url": url, "error": str(e)})
-            await save_to_history(url, request.prompt, str(e), status="error", mode=request.mode)
+            await save_to_history(app_.state.db, url, request.prompt, str(e), status="error", mode=request.mode)
 
     await asyncio.gather(*[scrape_one(url) for url in request.urls])
     return {
@@ -749,9 +815,9 @@ async def scrape_bulk(request: BulkScrapeRequest):
 # ── Agent navigateur autonome ──
 
 @app.post("/agent/search")
-async def agent_search(request: AgentSearchRequest):
+async def agent_search(request: AgentSearchRequest, http_request: Request):
     """
-    Lance un agent navigateur autonome pilote par Mistral Vision (Pixtral).
+    Lance un agent navigateur autonome pilote par Gemini Vision.
 
     L'agent navigue de lui-meme sur le site source pour trouver le contenu
     correspondant a l'intention, sans URL ni ID a fournir.
@@ -762,11 +828,12 @@ async def agent_search(request: AgentSearchRequest):
       "intent": "Stats du match PSG vs Barcelone du 7 mai 2025",
       "source": "sofascore.com",
       "prompt": "Extrais possession, xG et tirs cadres pour chaque equipe",
-      "max_steps": 12
+      "max_steps": 8
     }
     """
+    app_ = http_request.app
     try:
-        agent_result = await run_browser_agent(request.intent, request.source, request.max_steps)
+        agent_result = await run_browser_agent(app_, request.intent, request.source, request.max_steps)
 
         if not agent_result.get("content"):
             raise HTTPException(status_code=500, detail="L'agent n'a pas pu extraire de contenu")
@@ -777,12 +844,9 @@ async def agent_search(request: AgentSearchRequest):
         )
 
         history_id = await save_to_history(
-            agent_result["final_url"], request.prompt, answer, mode="agent", model=model_used
+            app_.state.db, agent_result["final_url"], request.prompt, answer, mode="agent", model=model_used
         )
 
-        # Avertissement si le dernier echange n'est pas un "extract" propre
-        # (sortie via max_steps/erreur de decision) ou si le clic precedent
-        # a echoue juste avant — le contenu peut alors etre incomplet.
         warning = None
         steps = agent_result["steps"]
         ended_with_extract = bool(steps) and steps[-1].get("action", {}).get("type") == "extract"
@@ -816,21 +880,21 @@ async def agent_search(request: AgentSearchRequest):
     except HTTPException:
         raise
     except Exception as e:
-        await save_to_history(request.source, request.prompt, str(e), status="error", mode="agent")
+        await save_to_history(app_.state.db, request.source, request.prompt, str(e), status="error", mode="agent")
         raise HTTPException(status_code=500, detail=f"Erreur agent : {str(e)}")
 
 # ── Historique ──
 
 @app.get("/history")
-async def get_history(limit: int = 50, offset: int = 0):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, url, prompt, status, mode, model, created_at FROM scrape_history ORDER BY id DESC LIMIT ? OFFSET ?",
-            (limit, offset)
-        ) as cursor:
-            rows = await cursor.fetchall()
-        async with db.execute("SELECT COUNT(*) FROM scrape_history") as cursor:
-            total = (await cursor.fetchone())[0]
+async def get_history(request: Request, limit: int = 50, offset: int = 0):
+    db = request.app.state.db
+    async with db.execute(
+        "SELECT id, url, prompt, status, mode, model, created_at FROM scrape_history ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset)
+    ) as cursor:
+        rows = await cursor.fetchall()
+    async with db.execute("SELECT COUNT(*) FROM scrape_history") as cursor:
+        total = (await cursor.fetchone())[0]
     return {
         "total": total,
         "limit": limit,
@@ -842,13 +906,13 @@ async def get_history(limit: int = 50, offset: int = 0):
     }
 
 @app.get("/history/{item_id}")
-async def get_history_item(item_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, url, prompt, result, status, mode, model, created_at FROM scrape_history WHERE id=?",
-            (item_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
+async def get_history_item(item_id: int, request: Request):
+    db = request.app.state.db
+    async with db.execute(
+        "SELECT id, url, prompt, result, status, mode, model, created_at FROM scrape_history WHERE id=?",
+        (item_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Entree introuvable")
     return {
@@ -860,13 +924,13 @@ async def get_history_item(item_id: int):
 # ── Export ──
 
 @app.get("/export/{item_id}")
-async def export_result(item_id: int, fmt: str = Query("json", alias="format", description="json | csv | pdf")):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, url, prompt, result, status, mode, model, created_at FROM scrape_history WHERE id=?",
-            (item_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
+async def export_result(item_id: int, request: Request, fmt: str = Query("json", alias="format", description="json | csv | pdf")):
+    db = request.app.state.db
+    async with db.execute(
+        "SELECT id, url, prompt, result, status, mode, model, created_at FROM scrape_history WHERE id=?",
+        (item_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Entree introuvable")
 
@@ -899,8 +963,6 @@ async def export_result(item_id: int, fmt: str = Query("json", alias="format", d
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter)
         styles = getSampleStyleSheet()
-        # Echappement XML pour eviter les erreurs reportlab si le contenu
-        # contient des caracteres speciaux (<, >, &) interpretes comme du markup.
         result_html = xml_escape(str(data["result"])).replace("\n", "<br/>")
         story = [
             Paragraph(f"ScraperWeb V2 — Export #{item_id}", styles["Title"]),
@@ -932,32 +994,33 @@ async def export_result(item_id: int, fmt: str = Query("json", alias="format", d
 
 # ── Planification ──
 
-async def scheduled_scrape(url: str, prompt: str, mode: str = "simple"):
+async def scheduled_scrape(app: FastAPI, url: str, prompt: str, mode: str = "simple"):
     try:
-        result = await scrape_single(url, prompt, mode)
-        await save_to_history(url, prompt, result["answer"], mode=mode, model=result.get("model", ""))
+        result = await scrape_single(app, url, prompt, mode)
+        await save_to_history(app.state.db, url, prompt, result["answer"], mode=mode, model=result.get("model", ""))
     except Exception as e:
-        await save_to_history(url, prompt, str(e), status="error", mode=mode)
+        await save_to_history(app.state.db, url, prompt, str(e), status="error", mode=mode)
 
 @app.post("/schedule")
-async def create_schedule(request: ScheduleRequest):
+async def create_schedule(request: ScheduleRequest, http_request: Request):
+    app_ = http_request.app
     try:
         trigger = CronTrigger.from_crontab(request.cron)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Expression cron invalide : {e}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "INSERT INTO scheduled_jobs (name, url, prompt, cron, mode) VALUES (?, ?, ?, ?, ?)",
-            (request.name, request.url, request.prompt, request.cron, request.mode)
-        )
-        job_id = cursor.lastrowid
-        await db.commit()
+    db = app_.state.db
+    cursor = await db.execute(
+        "INSERT INTO scheduled_jobs (name, url, prompt, cron, mode) VALUES (?, ?, ?, ?, ?)",
+        (request.name, request.url, request.prompt, request.cron, request.mode)
+    )
+    job_id = cursor.lastrowid
+    await db.commit()
 
     scheduler.add_job(
         scheduled_scrape,
         trigger,
-        args=[request.url, request.prompt, request.mode],
+        args=[app_, request.url, request.prompt, request.mode],
         id=f"job_{job_id}",
         name=request.name,
         replace_existing=True
@@ -974,12 +1037,12 @@ async def create_schedule(request: ScheduleRequest):
     }
 
 @app.get("/schedule")
-async def list_schedules():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, name, url, prompt, cron, mode, active, created_at FROM scheduled_jobs"
-        ) as cursor:
-            rows = await cursor.fetchall()
+async def list_schedules(request: Request):
+    db = request.app.state.db
+    async with db.execute(
+        "SELECT id, name, url, prompt, cron, mode, active, created_at FROM scheduled_jobs"
+    ) as cursor:
+        rows = await cursor.fetchall()
     return {
         "jobs": [
             {"id": r[0], "name": r[1], "url": r[2], "prompt": r[3],
@@ -989,10 +1052,10 @@ async def list_schedules():
     }
 
 @app.delete("/schedule/{job_id}")
-async def delete_schedule(job_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE scheduled_jobs SET active=0 WHERE id=?", (job_id,))
-        await db.commit()
+async def delete_schedule(job_id: int, request: Request):
+    db = request.app.state.db
+    await db.execute("UPDATE scheduled_jobs SET active=0 WHERE id=?", (job_id,))
+    await db.commit()
     try:
         scheduler.remove_job(f"job_{job_id}")
     except Exception:
