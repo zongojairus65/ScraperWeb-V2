@@ -6,11 +6,15 @@ import functools
 import io
 import ipaddress
 import json
+import logging
 import socket
+import time
+import uuid
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Literal
-from urllib.parse import urlparse
+from logging.handlers import RotatingFileHandler
+from typing import List, Literal, Optional
+from urllib.parse import urlparse, quote_plus, parse_qs, unquote
 from xml.sax.saxutils import escape as xml_escape
 
 import aiosqlite
@@ -32,6 +36,69 @@ from reportlab.lib.styles import getSampleStyleSheet
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+# Logs structures (console + fichier rotatif) pour tracer chaque appel :
+# requetes HTTP entrantes/sortantes, appels LLM (avec fallback), scraping
+# HTTP/browser, etapes de l'agent navigateur, jobs planifies, erreurs avec
+# contexte complet (date, duree, request_id).
+#
+# Chaque requete HTTP recoit un request_id court (voir api_key_middleware).
+# Ce request_id est propage explicitement aux fonctions internes via un
+# logging.LoggerAdapter (get_logger), pour retrouver facilement toutes les
+# lignes de log liees a un meme appel, meme quand le travail est delegue a
+# l'executor (threads) ou a l'agent navigateur (plusieurs etapes).
+
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+class _RequestIdDefaultFilter(logging.Filter):
+    """Garantit un champ request_id meme sur les logs sans LoggerAdapter."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = "-"
+        return True
+
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s | %(levelname)-8s | req=%(request_id)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+logger = logging.getLogger("scraperweb")
+logger.setLevel(LOG_LEVEL)
+logger.propagate = False
+
+if not logger.handlers:
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(_log_formatter)
+    _console_handler.addFilter(_RequestIdDefaultFilter())
+    logger.addHandler(_console_handler)
+
+    _file_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "scraperweb.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8"
+    )
+    _file_handler.setFormatter(_log_formatter)
+    _file_handler.addFilter(_RequestIdDefaultFilter())
+    logger.addHandler(_file_handler)
+
+# Reduit le bruit des libs tierces tres verbeuses (SDKs HTTP notamment)
+for _noisy in ("httpx", "httpcore", "urllib3", "apscheduler"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+def get_logger(request_id: str = "-") -> logging.LoggerAdapter:
+    """Retourne un logger lie a un request_id, pour tracer un appel de bout en bout."""
+    return logging.LoggerAdapter(logger, {"request_id": request_id})
+
+
+def new_request_id() -> str:
+    return uuid.uuid4().hex[:8]
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -99,6 +166,7 @@ def assert_public_url(url: str) -> None:
             ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified
         ):
+            logger.warning(f"SSRF bloque : {url} -> {hostname} resout vers {ip} (non autorisee)")
             raise ValueError(f"URL refusee : adresse non autorisee ({ip})")
 
 # ─── Base de données SQLite (async, connexion persistante) ────────────────────
@@ -158,6 +226,7 @@ async def save_to_history(
     )
     row_id = cursor.lastrowid
     await db.commit()
+    logger.info(f"Historique #{row_id} enregistre : url={url} mode={mode} status={status} model={model or '-'}")
     return row_id
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
@@ -168,11 +237,19 @@ async def save_to_history(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    startup_start = time.monotonic()
+    logger.info("Demarrage de ScraperWeb V2...")
+
     db = await aiosqlite.connect(DB_PATH)
     app.state.db = db
     await init_db(db)
+    logger.info(f"Base SQLite prete ({DB_PATH})")
 
-    get_mistral_client()
+    try:
+        get_mistral_client()
+        logger.info("Client Mistral initialise")
+    except Exception as e:
+        logger.warning(f"Client Mistral non initialise au demarrage : {e}")
 
     playwright_ctx = await async_playwright().start()
     app.state.playwright = playwright_ctx
@@ -180,6 +257,7 @@ async def lifespan(app: FastAPI):
         headless=True,
         args=["--disable-blink-features=AutomationControlled"]
     )
+    logger.info("Navigateur Chromium (Playwright) demarre")
 
     scheduler.start()
     async with db.execute(
@@ -196,13 +274,17 @@ async def lifespan(app: FastAPI):
             name=name,
             replace_existing=True
         )
+    logger.info(f"Planificateur demarre avec {len(jobs)} job(s) actif(s)")
+    logger.info(f"ScraperWeb V2 pret en {(time.monotonic() - startup_start) * 1000:.0f}ms")
 
     yield
 
+    logger.info("Arret de ScraperWeb V2...")
     scheduler.shutdown(wait=False)
     await app.state.browser.close()
     await playwright_ctx.stop()
     await db.close()
+    logger.info("Arret termine proprement")
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -212,7 +294,7 @@ API_KEY = os.getenv("API_KEY")
 app = FastAPI(
     title="ScraperWeb V2 API",
     description="API de web scraping IA — Mistral + SQLite + Export + Planification + Agent navigateur",
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
@@ -227,12 +309,49 @@ app.add_middleware(
 # ─── Auth middleware ───────────────────────────────────────────────────────────
 
 @app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """
+    Log chaque requete entrante et sortante : request_id, methode, chemin,
+    query params (api_key masquee), IP client, code de statut, duree, et
+    trace complete en cas d'exception non geree.
+    """
+    request_id = new_request_id()
+    request.state.request_id = request_id
+    log = get_logger(request_id)
+
+    safe_params = dict(request.query_params)
+    if "api_key" in safe_params:
+        safe_params["api_key"] = "***"
+    client_ip = request.client.host if request.client else "-"
+
+    start = time.monotonic()
+    log.info(f"--> {request.method} {request.url.path} params={safe_params} ip={client_ip}")
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.monotonic() - start) * 1000
+        log.exception(f"<-- {request.method} {request.url.path} EXCEPTION NON GEREE apres {duration_ms:.0f}ms")
+        raise
+
+    duration_ms = (time.monotonic() - start) * 1000
+    level = logging.INFO if response.status_code < 400 else logging.WARNING
+    log.log(level, f"<-- {request.method} {request.url.path} status={response.status_code} duree={duration_ms:.0f}ms")
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     if API_KEY:
         public_paths = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
         if request.method != "OPTIONS" and request.url.path not in public_paths:
             key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
             if key != API_KEY:
+                request_id = getattr(request.state, "request_id", "-")
+                get_logger(request_id).warning(
+                    f"Cle API invalide/manquante pour {request.method} {request.url.path}"
+                )
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Clé API invalide ou manquante. Fournissez X-API-Key dans les headers."}
@@ -288,29 +407,43 @@ async def settle(page):
 
 # ─── Scraping HTTP — mode simple (inchange) ───────────────────────────────────
 
-def fetch_page_content(url: str) -> str:
+def fetch_page_content(url: str, request_id: str = "-") -> str:
     """Recupere le contenu HTML brut via requests (synchrone, executor)."""
+    log = get_logger(request_id)
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
     assert_public_url(url)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; ScraperWebBot/2.0)"}
-    response = http_requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-    response.raise_for_status()
-    assert_public_url(response.url)
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    return soup.get_text(separator="\n", strip=True)[:12000]
+    start = time.monotonic()
+    log.info(f"[fetch_page_content] GET {url}")
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ScraperWebBot/2.0)"}
+        response = http_requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        response.raise_for_status()
+        assert_public_url(response.url)
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)[:12000]
+        duration_ms = (time.monotonic() - start) * 1000
+        log.info(f"[fetch_page_content] OK {url} status={response.status_code} taille={len(text)} duree={duration_ms:.0f}ms")
+        return text
+    except Exception as e:
+        duration_ms = (time.monotonic() - start) * 1000
+        log.error(f"[fetch_page_content] ECHEC {url} apres {duration_ms:.0f}ms : {e}")
+        raise
 
 # ─── Scraping navigateur — mode browser (URL connue) ─────────────────────────
 # OPTIM : reutilise le navigateur persistant (app.state.browser), plus de
 # chromium.launch() par requete. domcontentloaded + attente courte au lieu
 # de networkidle. Images bloquees (pas de vision necessaire ici).
 
-async def fetch_page_browser(app: FastAPI, url: str) -> str:
+async def fetch_page_browser(app: FastAPI, url: str, request_id: str = "-") -> str:
+    log = get_logger(request_id)
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
     assert_public_url(url)
+    start = time.monotonic()
+    log.info(f"[fetch_page_browser] navigation vers {url}")
     browser = app.state.browser
     context, page = await new_hardened_page(browser, block_images=True)
     try:
@@ -318,12 +451,86 @@ async def fetch_page_browser(app: FastAPI, url: str) -> str:
         await dismiss_cookie_banner(page)
         await settle(page)
         content = await page.content()
+    except Exception as e:
+        duration_ms = (time.monotonic() - start) * 1000
+        log.error(f"[fetch_page_browser] ECHEC {url} apres {duration_ms:.0f}ms : {e}")
+        raise
     finally:
         await context.close()
     soup = BeautifulSoup(content, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
-    return soup.get_text(separator="\n", strip=True)[:12000]
+    text = soup.get_text(separator="\n", strip=True)[:12000]
+    duration_ms = (time.monotonic() - start) * 1000
+    log.info(f"[fetch_page_browser] OK {url} taille={len(text)} duree={duration_ms:.0f}ms")
+    return text
+
+# ─── SERP — recherche moteur de recherche ─────────────────────────────────────
+# Recupere les resultats d'une recherche (titre, url, extrait) via le moteur
+# HTML de DuckDuckGo (pas de cle API requise, coherent avec le reste du projet
+# qui evite les dependances a des services payants pour le scraping).
+# Reutilisable seul (/serp) ou combine a l'analyse LLM (/serp/analyze) pour
+# repondre a une question en agregant plusieurs resultats de recherche.
+
+SERP_SOURCE_URL = "https://html.duckduckgo.com/html/"
+
+
+def _unwrap_ddg_url(href: str) -> str:
+    """DuckDuckGo HTML redirige les liens via /l/?uddg=<url encodee> ; on extrait l'URL reelle."""
+    if href.startswith("//"):
+        href = "https:" + href
+    if "duckduckgo.com/l/" in href:
+        parsed = urlparse(href)
+        qs = parse_qs(parsed.query)
+        real = qs.get("uddg", [None])[0]
+        if real:
+            return unquote(real)
+    return href
+
+
+def fetch_serp_results(query: str, num_results: int = 10, request_id: str = "-") -> list[dict]:
+    """
+    Recupere les resultats de recherche (titre, url, extrait) pour `query`.
+    Synchrone (executor), meme pattern que fetch_page_content.
+    """
+    log = get_logger(request_id)
+    start = time.monotonic()
+    log.info(f"[fetch_serp_results] recherche query={query!r} num_results={num_results}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; ScraperWebBot/2.0)",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    try:
+        response = http_requests.post(
+            SERP_SOURCE_URL, data={"q": query}, headers=headers, timeout=15
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        results = []
+        for result_div in soup.select("div.result"):
+            link_tag = result_div.select_one("a.result__a")
+            if not link_tag:
+                continue
+            title = link_tag.get_text(strip=True)
+            href = _unwrap_ddg_url(link_tag.get("href", ""))
+            snippet_tag = result_div.select_one(".result__snippet")
+            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+            if title and href:
+                results.append({"title": title, "url": href, "snippet": snippet})
+            if len(results) >= num_results:
+                break
+
+        duration_ms = (time.monotonic() - start) * 1000
+        if not results:
+            log.warning(f"[fetch_serp_results] AUCUN resultat pour query={query!r} (duree={duration_ms:.0f}ms) — page bloquee/format modifie ?")
+        else:
+            log.info(f"[fetch_serp_results] OK query={query!r} resultats={len(results)} duree={duration_ms:.0f}ms")
+        return results
+    except Exception as e:
+        duration_ms = (time.monotonic() - start) * 1000
+        log.error(f"[fetch_serp_results] ECHEC query={query!r} apres {duration_ms:.0f}ms : {e}")
+        raise
 
 # ─── Analyse texte LLM (Gemini principal, Magistral fallback) ─────────────────
 
@@ -355,7 +562,7 @@ def extract_text_from_content(content) -> str:
     return str(content)
 
 
-def run_llm(content: str, prompt: str) -> tuple[str, str]:
+def run_llm(content: str, prompt: str, request_id: str = "-") -> tuple[str, str]:
     """
     Envoie le contenu au LLM pour analyse (synchrone, executor).
 
@@ -366,6 +573,7 @@ def run_llm(content: str, prompt: str) -> tuple[str, str]:
 
     Retourne (reponse, nom_du_modele_utilise).
     """
+    log = get_logger(request_id)
     user_message = f"""Voici le contenu d'une page web :
 
 {content}
@@ -377,67 +585,69 @@ Reponds de maniere precise et structuree en te basant uniquement sur le contenu 
 
     errors = []
 
-    try:
-        client = get_gemini_client()
-        response = client.models.generate_content(
-            model=GEMINI_LITE_MODEL,
-            contents=user_message,
-        )
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("Reponse Gemini Flash Lite vide")
-        return text, GEMINI_LITE_MODEL
-    except Exception as e:
-        errors.append(f"Gemini Flash Lite: {e}")
+    for model_name, label in (
+        (GEMINI_LITE_MODEL, "Gemini Flash Lite"),
+        (GEMINI_MODEL, "Gemini Flash"),
+        (GEMMA_MODEL, "Gemma 4"),
+    ):
+        attempt_start = time.monotonic()
+        log.info(f"[run_llm] tentative {label} ({model_name})")
+        try:
+            client = get_gemini_client()
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_message,
+            )
+            text = (response.text or "").strip()
+            if not text:
+                raise ValueError(f"Reponse {label} vide")
+            duration_ms = (time.monotonic() - attempt_start) * 1000
+            log.info(f"[run_llm] OK {label} en {duration_ms:.0f}ms (reponse={len(text)} caracteres)")
+            return text, model_name
+        except Exception as e:
+            duration_ms = (time.monotonic() - attempt_start) * 1000
+            log.warning(f"[run_llm] echec {label} apres {duration_ms:.0f}ms : {e}")
+            errors.append(f"{label}: {e}")
 
-    try:
-        client = get_gemini_client()
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_message,
-        )
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("Reponse Gemini vide")
-        return text, GEMINI_MODEL
-    except Exception as e:
-        errors.append(f"Gemini: {e}")
-
-    try:
-        client = get_gemini_client()
-        response = client.models.generate_content(
-            model=GEMMA_MODEL,
-            contents=user_message,
-        )
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("Reponse Gemma vide")
-        return text, GEMMA_MODEL
-    except Exception as e:
-        errors.append(f"Gemma: {e}")
-
+    attempt_start = time.monotonic()
+    log.info(f"[run_llm] tentative Magistral ({MAGISTRAL_MODEL}) — dernier recours")
     try:
         client = get_mistral_client()
         messages = [{"role": "user", "content": user_message}]
         response = client.chat.complete(model=MAGISTRAL_MODEL, messages=messages)
         raw_content = response.choices[0].message.content
         text = extract_text_from_content(raw_content)
+        duration_ms = (time.monotonic() - attempt_start) * 1000
+        log.info(f"[run_llm] OK Magistral en {duration_ms:.0f}ms (reponse={len(text)} caracteres)")
         return text, MAGISTRAL_MODEL
     except Exception as e:
+        duration_ms = (time.monotonic() - attempt_start) * 1000
+        log.error(f"[run_llm] echec Magistral apres {duration_ms:.0f}ms : {e}")
         errors.append(f"Magistral: {e}")
+        log.error(f"[run_llm] echec de TOUS les modeles LLM : {' | '.join(errors)}")
         raise RuntimeError("Echec de tous les modeles LLM : " + " | ".join(errors))
 
 # ─── Scraping unifie simple + browser ────────────────────────────────────────
 
-async def scrape_single(app: FastAPI, url: str, prompt: str, mode: str = "simple") -> dict:
+async def scrape_single(app: FastAPI, url: str, prompt: str, mode: str = "simple", request_id: str = "-") -> dict:
+    log = get_logger(request_id)
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
+    start = time.monotonic()
+    log.info(f"[scrape_single] debut url={url} mode={mode} prompt={prompt!r}")
     loop = asyncio.get_running_loop()
-    if mode == "browser":
-        content = await fetch_page_browser(app, url)
-    else:
-        content = await loop.run_in_executor(executor, fetch_page_content, url)
-    answer, model_used = await loop.run_in_executor(executor, run_llm, content, prompt)
+    try:
+        if mode == "browser":
+            content = await fetch_page_browser(app, url, request_id)
+        else:
+            content = await loop.run_in_executor(executor, fetch_page_content, url, request_id)
+        answer, model_used = await loop.run_in_executor(executor, run_llm, content, prompt, request_id)
+    except Exception as e:
+        duration_ms = (time.monotonic() - start) * 1000
+        log.error(f"[scrape_single] ECHEC url={url} mode={mode} apres {duration_ms:.0f}ms : {e}")
+        raise
+    duration_ms = (time.monotonic() - start) * 1000
+    log.info(f"[scrape_single] termine url={url} mode={mode} model={model_used} duree={duration_ms:.0f}ms")
     return {"url": url, "prompt": prompt, "answer": answer, "mode": mode, "model": model_used}
 
 # ─── Agent navigateur autonome ─────────────────────────────────────────────────
@@ -479,7 +689,8 @@ def decide_action_with_gemini(
     url: str,
     step: int,
     max_steps: int,
-    history: list
+    history: list,
+    request_id: str = "-"
 ) -> dict:
     """
     Appelle Gemini (vision) avec le screenshot courant pour obtenir la prochaine action.
@@ -487,6 +698,7 @@ def decide_action_with_gemini(
     en secours si le premier echoue ou est rate-limite.
     Synchrone — exécuté dans le thread executor.
     """
+    log = get_logger(request_id)
     client = get_gemini_client()
     prompt = AGENT_DECISION_PROMPT.format(
         intent=intent,
@@ -500,6 +712,7 @@ def decide_action_with_gemini(
 
     errors = []
     for model_name in (GEMINI_LITE_MODEL, GEMMA_MODEL):
+        attempt_start = time.monotonic()
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -509,10 +722,16 @@ def decide_action_with_gemini(
             if not raw:
                 raise ValueError("Reponse vide")
             raw = raw.replace("```json", "").replace("```", "").strip()
-            return json.loads(raw)
+            action = json.loads(raw)
+            duration_ms = (time.monotonic() - attempt_start) * 1000
+            log.info(f"[agent:decision] etape={step} modele={model_name} action={action} duree={duration_ms:.0f}ms")
+            return action
         except Exception as e:
+            duration_ms = (time.monotonic() - attempt_start) * 1000
+            log.warning(f"[agent:decision] etape={step} echec {model_name} apres {duration_ms:.0f}ms : {e}")
             errors.append(f"{model_name}: {e}")
 
+    log.error(f"[agent:decision] etape={step} echec total : {' | '.join(errors)}")
     raise RuntimeError("Echec de la decision agent (vision) : " + " | ".join(errors))
 
 
@@ -520,7 +739,7 @@ async def _try_click(page, locator_factory, timeout_ms: int) -> None:
     await locator_factory().click(timeout=timeout_ms)
 
 
-async def execute_action(page, action: dict) -> str:
+async def execute_action(page, action: dict, request_id: str = "-") -> str:
     """
     Execute une action Playwright.
 
@@ -529,6 +748,7 @@ async def execute_action(page, action: dict) -> str:
     strategies x 3-4s de timeout chacune (~16s pire cas). Apres : borne au
     timeout de la strategie la plus lente qui reussit (~2.5s pire cas typique).
     """
+    log = get_logger(request_id)
     action_type = action.get("type")
 
     if action_type == "click":
@@ -573,9 +793,11 @@ async def execute_action(page, action: dict) -> str:
                     t.cancel()
 
         if not succeeded:
+            log.warning(f"[agent:action] clic ECHEC sur '{text}' : {last_error}")
             raise last_error or RuntimeError(f"Aucune strategie de clic n'a fonctionne pour '{text}'")
 
         await settle(page)
+        log.info(f"[agent:action] clic OK sur '{text}'")
         return f"Clique sur '{text}'"
 
     elif action_type == "type":
@@ -583,17 +805,22 @@ async def execute_action(page, action: dict) -> str:
         await page.keyboard.type(text, delay=30)
         await page.keyboard.press("Enter")
         await settle(page)
+        log.info(f"[agent:action] saisie OK '{text}'")
         return f"Saisi '{text}' + Entree"
 
     elif action_type == "scroll":
         await page.evaluate("window.scrollBy(0, 600)")
         await page.wait_for_timeout(500)
+        log.info("[agent:action] scroll OK (600px)")
         return "Scroll de 600px vers le bas"
 
+    log.warning(f"[agent:action] type d'action non reconnu : {action_type}")
     return f"Action non reconnue : {action_type}"
 
 
-async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: int = DEFAULT_MAX_STEPS) -> dict:
+async def run_browser_agent(
+    app: FastAPI, intent: str, source: str, max_steps: int = DEFAULT_MAX_STEPS, request_id: str = "-"
+) -> dict:
     """
     Agent navigateur autonome piloté par Gemini Vision.
 
@@ -602,7 +829,10 @@ async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: i
     - domcontentloaded + attente courte au lieu de networkidle partout
     - arret anticipe si 2 echecs consecutifs sans progression (meme URL)
     """
+    log = get_logger(request_id)
+    agent_start = time.monotonic()
     base_url = source if source.startswith("http") else f"https://{source}"
+    log.info(f"[agent] debut intent={intent!r} source={base_url} max_steps={max_steps}")
     loop = asyncio.get_running_loop()
     history = []
     steps_log = []
@@ -626,11 +856,12 @@ async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: i
                 action = await loop.run_in_executor(
                     executor,
                     decide_action_with_gemini,
-                    screenshot_b64, intent, current_url, step, max_steps, history
+                    screenshot_b64, intent, current_url, step, max_steps, history, request_id
                 )
             except Exception as e:
                 err_str = str(e)
                 if "429" in err_str or "rate" in err_str.lower():
+                    log.warning(f"[agent] etape={step} decision rate-limitee, nouvelle tentative dans 2s : {err_str}")
                     steps_log.append({
                         "step": step, "url": current_url,
                         "error": f"Decision LLM rate-limitee, nouvelle tentative : {err_str}"
@@ -640,12 +871,14 @@ async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: i
                         action = await loop.run_in_executor(
                             executor,
                             decide_action_with_gemini,
-                            screenshot_b64, intent, current_url, step, max_steps, history
+                            screenshot_b64, intent, current_url, step, max_steps, history, request_id
                         )
                     except Exception as e2:
+                        log.error(f"[agent] etape={step} decision echouee apres retry : {e2}")
                         steps_log.append({"step": step, "url": current_url, "error": f"Decision LLM echouee apres retry : {e2}"})
                         break
                 else:
+                    log.error(f"[agent] etape={step} decision echouee : {err_str}")
                     steps_log.append({"step": step, "url": current_url, "error": f"Decision LLM echouee : {err_str}"})
                     break
 
@@ -668,6 +901,8 @@ async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: i
                 soup = BeautifulSoup(content, "html.parser")
                 for tag in soup(["script", "style", "nav", "footer", "header"]):
                     tag.decompose()
+                duration_ms = (time.monotonic() - agent_start) * 1000
+                log.info(f"[agent] termine avec succes en {step} etape(s), duree={duration_ms:.0f}ms, url_finale={current_url}")
                 return {
                     "success": True,
                     "final_url": current_url,
@@ -676,7 +911,7 @@ async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: i
                 }
 
             try:
-                description = await execute_action(page, action)
+                description = await execute_action(page, action, request_id)
                 log_entry["result"] = description
                 consecutive_failures = 0
             except Exception as e:
@@ -694,6 +929,7 @@ async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: i
             # OPTIM : arret anticipe si 2 echecs consecutifs sans progression,
             # au lieu de consommer tout le budget max_steps inutilement.
             if consecutive_failures >= 2:
+                log.warning(f"[agent] arret anticipe a l'etape {step} : 2 echecs consecutifs sans progression")
                 steps_log.append({
                     "step": step, "url": page.url,
                     "note": "Arret anticipe : 2 echecs consecutifs sans progression"
@@ -710,6 +946,11 @@ async def run_browser_agent(app: FastAPI, intent: str, source: str, max_steps: i
         tag.decompose()
 
     navigated_away = final_url.rstrip("/") != base_url.rstrip("/")
+    duration_ms = (time.monotonic() - agent_start) * 1000
+    log.info(
+        f"[agent] termine sans 'extract' explicite, success={navigated_away}, "
+        f"duree={duration_ms:.0f}ms, url_finale={final_url}"
+    )
     return {
         "success": navigated_away,
         "reason": (
@@ -753,6 +994,8 @@ async def root():
             "scrape":  "GET  /scrape?url=...&prompt=...&mode=simple|browser",
             "bulk":    "POST /scrape/bulk",
             "agent":   "POST /agent/search",
+            "serp":    "GET  /serp?query=...&num_results=10",
+            "serp_analyze": "GET  /serp/analyze?query=...&prompt=...&num_results=10",
             "history": "GET  /history",
             "export":  "GET  /export/{id}?format=json|csv|pdf",
             "schedule":"POST /schedule",
@@ -777,11 +1020,13 @@ async def scrape(
     )
 ):
     app_ = request.app
+    request_id = getattr(request.state, "request_id", "-")
     try:
-        result = await scrape_single(app_, url, prompt, mode)
+        result = await scrape_single(app_, url, prompt, mode, request_id)
         history_id = await save_to_history(app_.state.db, url, prompt, result["answer"], mode=mode, model=result.get("model", ""))
         return {"status": "success", "id": history_id, **result}
     except Exception as e:
+        get_logger(request_id).exception(f"[/scrape] echec url={url} mode={mode}")
         await save_to_history(app_.state.db, url, prompt, str(e), status="error", mode=mode)
         raise HTTPException(status_code=500, detail=f"Erreur : {str(e)}")
 
@@ -790,19 +1035,25 @@ async def scrape(
 @app.post("/scrape/bulk")
 async def scrape_bulk(request: BulkScrapeRequest, http_request: Request):
     app_ = http_request.app
+    request_id = getattr(http_request.state, "request_id", "-")
+    log = get_logger(request_id)
     results = []
     errors = []
 
+    log.info(f"[/scrape/bulk] debut : {len(request.urls)} url(s), mode={request.mode}")
+
     async def scrape_one(url):
         try:
-            result = await scrape_single(app_, url, request.prompt, request.mode)
+            result = await scrape_single(app_, url, request.prompt, request.mode, request_id)
             hid = await save_to_history(app_.state.db, url, request.prompt, result["answer"], mode=request.mode, model=result.get("model", ""))
             results.append({"id": hid, **result})
         except Exception as e:
+            log.error(f"[/scrape/bulk] echec url={url} : {e}")
             errors.append({"url": url, "error": str(e)})
             await save_to_history(app_.state.db, url, request.prompt, str(e), status="error", mode=request.mode)
 
     await asyncio.gather(*[scrape_one(url) for url in request.urls])
+    log.info(f"[/scrape/bulk] termine : succes={len(results)} echecs={len(errors)}")
     return {
         "status": "success",
         "total": len(request.urls),
@@ -811,6 +1062,91 @@ async def scrape_bulk(request: BulkScrapeRequest, http_request: Request):
         "results": results,
         "errors": errors
     }
+
+# ── SERP : recherche moteur de recherche ──
+
+@app.get("/serp")
+async def serp(
+    request: Request,
+    query: str = Query(..., description="Termes de recherche"),
+    num_results: int = Query(10, ge=1, le=30, description="Nombre de resultats souhaites")
+):
+    """
+    Recherche `query` sur le web (moteur DuckDuckGo, pas de cle API requise)
+    et retourne les resultats bruts (titre, url, extrait), sans analyse LLM.
+    """
+    app_ = request.app
+    request_id = getattr(request.state, "request_id", "-")
+    log = get_logger(request_id)
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(executor, fetch_serp_results, query, num_results, request_id)
+        history_id = await save_to_history(
+            app_.state.db, SERP_SOURCE_URL, query,
+            json.dumps(results, ensure_ascii=False), mode="serp"
+        )
+        return {
+            "status": "success",
+            "id": history_id,
+            "query": query,
+            "count": len(results),
+            "results": results
+        }
+    except Exception as e:
+        log.exception(f"[/serp] echec query={query!r}")
+        await save_to_history(app_.state.db, SERP_SOURCE_URL, query, str(e), status="error", mode="serp")
+        raise HTTPException(status_code=500, detail=f"Erreur SERP : {str(e)}")
+
+@app.get("/serp/analyze")
+async def serp_analyze(
+    request: Request,
+    query: str = Query(..., description="Termes de recherche"),
+    prompt: str = Query(..., description="Question a laquelle repondre a partir des resultats"),
+    num_results: int = Query(10, ge=1, le=30, description="Nombre de resultats a agreger")
+):
+    """
+    Recherche `query` sur le web puis demande au LLM (meme chaine de fallback
+    que /scrape : Gemini Flash Lite -> Gemini Flash -> Gemma 4 -> Magistral)
+    de repondre a `prompt` en se basant sur les titres/extraits obtenus.
+
+    Utile pour des questions ouvertes ne visant pas un site precis, contrairement
+    a /scrape (une page connue) ou /agent/search (navigation guidee sur un site).
+    """
+    app_ = request.app
+    request_id = getattr(request.state, "request_id", "-")
+    log = get_logger(request_id)
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(executor, fetch_serp_results, query, num_results, request_id)
+        if not results:
+            log.warning(f"[/serp/analyze] aucun resultat pour query={query!r}")
+            raise HTTPException(status_code=404, detail="Aucun resultat de recherche trouve")
+
+        content = "\n\n".join(
+            f"[{i+1}] {r['title']}\n{r['url']}\n{r['snippet']}"
+            for i, r in enumerate(results)
+        )
+        answer, model_used = await loop.run_in_executor(executor, run_llm, content, prompt, request_id)
+
+        history_id = await save_to_history(
+            app_.state.db, SERP_SOURCE_URL, f"{query} | {prompt}", answer, mode="serp", model=model_used
+        )
+        return {
+            "status": "success",
+            "id": history_id,
+            "query": query,
+            "prompt": prompt,
+            "answer": answer,
+            "mode": "serp",
+            "model": model_used,
+            "sources": results
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception(f"[/serp/analyze] echec query={query!r}")
+        await save_to_history(app_.state.db, SERP_SOURCE_URL, f"{query} | {prompt}", str(e), status="error", mode="serp")
+        raise HTTPException(status_code=500, detail=f"Erreur SERP : {str(e)}")
 
 # ── Agent navigateur autonome ──
 
@@ -832,15 +1168,18 @@ async def agent_search(request: AgentSearchRequest, http_request: Request):
     }
     """
     app_ = http_request.app
+    request_id = getattr(http_request.state, "request_id", "-")
+    log = get_logger(request_id)
     try:
-        agent_result = await run_browser_agent(app_, request.intent, request.source, request.max_steps)
+        agent_result = await run_browser_agent(app_, request.intent, request.source, request.max_steps, request_id)
 
         if not agent_result.get("content"):
+            log.error("[/agent/search] aucun contenu extrait par l'agent")
             raise HTTPException(status_code=500, detail="L'agent n'a pas pu extraire de contenu")
 
         loop = asyncio.get_running_loop()
         answer, model_used = await loop.run_in_executor(
-            executor, run_llm, agent_result["content"], request.prompt
+            executor, run_llm, agent_result["content"], request.prompt, request_id
         )
 
         history_id = await save_to_history(
@@ -880,6 +1219,7 @@ async def agent_search(request: AgentSearchRequest, http_request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        log.exception(f"[/agent/search] echec intent={request.intent!r} source={request.source}")
         await save_to_history(app_.state.db, request.source, request.prompt, str(e), status="error", mode="agent")
         raise HTTPException(status_code=500, detail=f"Erreur agent : {str(e)}")
 
@@ -995,18 +1335,26 @@ async def export_result(item_id: int, request: Request, fmt: str = Query("json",
 # ── Planification ──
 
 async def scheduled_scrape(app: FastAPI, url: str, prompt: str, mode: str = "simple"):
+    request_id = f"cron-{new_request_id()}"
+    log = get_logger(request_id)
+    log.info(f"[cron] declenchement job url={url} mode={mode}")
     try:
-        result = await scrape_single(app, url, prompt, mode)
+        result = await scrape_single(app, url, prompt, mode, request_id)
         await save_to_history(app.state.db, url, prompt, result["answer"], mode=mode, model=result.get("model", ""))
+        log.info(f"[cron] job termine avec succes url={url}")
     except Exception as e:
+        log.exception(f"[cron] job en echec url={url}")
         await save_to_history(app.state.db, url, prompt, str(e), status="error", mode=mode)
 
 @app.post("/schedule")
 async def create_schedule(request: ScheduleRequest, http_request: Request):
     app_ = http_request.app
+    request_id = getattr(http_request.state, "request_id", "-")
+    log = get_logger(request_id)
     try:
         trigger = CronTrigger.from_crontab(request.cron)
     except ValueError as e:
+        log.warning(f"[/schedule] expression cron invalide '{request.cron}' : {e}")
         raise HTTPException(status_code=400, detail=f"Expression cron invalide : {e}")
 
     db = app_.state.db
@@ -1025,6 +1373,7 @@ async def create_schedule(request: ScheduleRequest, http_request: Request):
         name=request.name,
         replace_existing=True
     )
+    log.info(f"[/schedule] job cree id={job_id} name={request.name!r} cron={request.cron!r}")
 
     return {
         "status": "scheduled",
@@ -1054,10 +1403,12 @@ async def list_schedules(request: Request):
 @app.delete("/schedule/{job_id}")
 async def delete_schedule(job_id: int, request: Request):
     db = request.app.state.db
+    request_id = getattr(request.state, "request_id", "-")
     await db.execute("UPDATE scheduled_jobs SET active=0 WHERE id=?", (job_id,))
     await db.commit()
     try:
         scheduler.remove_job(f"job_{job_id}")
-    except Exception:
-        pass
+    except Exception as e:
+        get_logger(request_id).warning(f"[/schedule] job_{job_id} deja absent du scheduler : {e}")
+    get_logger(request_id).info(f"[/schedule] job supprime id={job_id}")
     return {"status": "deleted", "id": job_id}
