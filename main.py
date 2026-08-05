@@ -40,9 +40,9 @@ executor = ThreadPoolExecutor(max_workers=8)
 scheduler = AsyncIOScheduler()
 
 GEMINI_LITE_MODEL = "models/gemini-flash-lite-latest"
-GEMINI_MODEL = "models/gemini-flash-latest"
+GEMINI_MODEL = "models/gemini-2.5-flash-lite"
 GEMMA_MODEL = "gemma-4-26b-a4b-it"
-MAGISTRAL_MODEL = "magistral-medium-latest"
+MAGISTRAL_MODEL = "mistral-small-latest"
 
 # ── Réglages perf agent navigateur (OPTIM) ──
 # Avant : wait_until="networkidle" partout -> beaucoup de sites (trackers,
