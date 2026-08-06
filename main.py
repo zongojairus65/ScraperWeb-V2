@@ -294,7 +294,7 @@ API_KEY = os.getenv("API_KEY")
 app = FastAPI(
     title="ScraperWeb V2 API",
     description="API de web scraping IA — Mistral + SQLite + Export + Planification + Agent navigateur",
-    version="2.4.1",
+    version="2.4.2",
     lifespan=lifespan,
 )
 
@@ -465,28 +465,24 @@ async def fetch_page_browser(app: FastAPI, url: str, request_id: str = "-") -> s
     log.info(f"[fetch_page_browser] OK {url} taille={len(text)} duree={duration_ms:.0f}ms")
     return text
 
-# ─── SERP — recherche moteur de recherche ─────────────────────────────────────
-# Recupere les resultats d'une recherche (titre, url, extrait) via le moteur
-# HTML de DuckDuckGo (pas de cle API requise, coherent avec le reste du projet
-# qui evite les dependances a des services payants pour le scraping).
-# Reutilisable seul (/serp) ou combine a l'analyse LLM (/serp/analyze) pour
-# repondre a une question en agregant plusieurs resultats de recherche.
-
-# ─── SERP — recherche moteur de recherche ─────────────────────────────────────
-# Recupere les resultats d'une recherche (titre, url, extrait) via le moteur
-# HTML de DuckDuckGo (pas de cle API requise, coherent avec le reste du projet
-# qui evite les dependances a des services payants pour le scraping).
-# Reutilisable seul (/serp) ou combine a l'analyse LLM (/serp/analyze) pour
-# repondre a une question en agregant plusieurs resultats de recherche.
+# ─── SERP — recherche moteur de recherche (fallback multi-moteurs) ────────────
+# Recupere les resultats d'une recherche (titre, url, extrait). Comme pour les
+# LLM (voir run_llm), on utilise une CHAINE DE FALLBACK plutot qu'un seul
+# moteur : DuckDuckGo -> Bing -> Yandex, dans cet ordre. On garde le premier
+# moteur qui renvoie au moins un resultat.
 #
 # IMPORTANT : on passe par le navigateur Playwright persistant (comme
-# fetch_page_browser), PAS par `requests`. DuckDuckGo bloque tres agressivement
-# les requetes HTTP brutes venant d'IP de datacenter (Render/Railway/etc.) —
-# la reponse revient "200 OK" mais vide/tronquee, donc l'echec est silencieux
-# avec `requests`. Le navigateur (vrai user-agent, JS, cookies) contourne
-# nettement mieux ce blocage.
-
-SERP_SOURCE_URL = "https://html.duckduckgo.com/html/"
+# fetch_page_browser), PAS par `requests`. Ces moteurs bloquent tres
+# agressivement les requetes HTTP brutes venant d'IP de datacenter
+# (Render/Railway/etc.) — la reponse revient souvent "200 OK" mais
+# vide/tronquee/page de blocage, donc l'echec est silencieux avec `requests`.
+# Le navigateur (vrai user-agent, JS, cookies) contourne nettement mieux ca,
+# meme si aucun moteur n'est garanti a 100% (tous peuvent presenter un captcha
+# ponctuellement). En cas d'echec de TOUS les moteurs, `fetch_serp_results`
+# renvoie un diagnostic detaille (taille de la page recue + extrait de texte)
+# pour chaque moteur essaye, stocke dans l'historique (/history/{id}) et
+# renvoye directement dans la reponse API — pas besoin d'acces aux logs
+# serveur pour comprendre ce qui a bloque.
 
 
 def _unwrap_ddg_url(href: str) -> str:
@@ -502,11 +498,9 @@ def _unwrap_ddg_url(href: str) -> str:
     return href
 
 
-def _parse_serp_html(html: str, num_results: int) -> list[dict]:
-    """Extrait titre/url/extrait des resultats a partir du HTML DuckDuckGo."""
+def _parse_duckduckgo_html(html: str, num_results: int) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     results = []
-    # Selecteur principal (version "html.duckduckgo.com/html/")
     result_divs = soup.select("div.result") or soup.select("div.web-result")
     for result_div in result_divs:
         link_tag = (
@@ -527,42 +521,132 @@ def _parse_serp_html(html: str, num_results: int) -> list[dict]:
     return results
 
 
-async def fetch_serp_results(app: FastAPI, query: str, num_results: int = 10, request_id: str = "-") -> list[dict]:
+def _parse_bing_html(html: str, num_results: int) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    for li in soup.select("li.b_algo"):
+        link_tag = li.select_one("h2 a")
+        if not link_tag:
+            continue
+        title = link_tag.get_text(strip=True)
+        href = link_tag.get("href", "")
+        snippet_tag = li.select_one(".b_caption p") or li.select_one(".b_caption")
+        snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+        if title and href:
+            results.append({"title": title, "url": href, "snippet": snippet})
+        if len(results) >= num_results:
+            break
+    return results
+
+
+def _parse_yandex_html(html: str, num_results: int) -> list[dict]:
     """
-    Recupere les resultats de recherche (titre, url, extrait) pour `query`
-    via le navigateur Playwright persistant (app.state.browser).
+    Parsing best-effort : Yandex change frequemment ses classes CSS (souvent
+    hashees). On s'appuie sur les quelques classes semantiques encore stables
+    (organic, serp-item) et on retombe sur le premier lien http trouve sinon.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    for item in soup.select("li.serp-item, div.serp-item"):
+        link_tag = item.select_one("a.OrganicTitle-Link") or item.find("a", href=True)
+        if not link_tag:
+            continue
+        href = link_tag.get("href", "")
+        if not href.startswith("http") or "yandex." in href:
+            continue
+        title = link_tag.get_text(strip=True)
+        snippet_tag = item.select_one("[class*='Text']") or item.select_one("[class*='text']")
+        snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+        if title and href:
+            results.append({"title": title, "url": href, "snippet": snippet})
+        if len(results) >= num_results:
+            break
+    return results
+
+
+SERP_ENGINES = [
+    {
+        "name": "duckduckgo",
+        "build_url": lambda q: f"https://html.duckduckgo.com/html/?q={quote_plus(q)}",
+        "parse": _parse_duckduckgo_html,
+    },
+    {
+        "name": "bing",
+        "build_url": lambda q: f"https://www.bing.com/search?q={quote_plus(q)}&setlang=en",
+        "parse": _parse_bing_html,
+    },
+    {
+        "name": "yandex",
+        "build_url": lambda q: f"https://yandex.com/search/?text={quote_plus(q)}",
+        "parse": _parse_yandex_html,
+    },
+]
+
+
+async def fetch_serp_results(
+    app: FastAPI, query: str, num_results: int = 10, request_id: str = "-"
+) -> tuple[list[dict], str | None, list[dict]]:
+    """
+    Recupere les resultats de recherche (titre, url, extrait) pour `query`,
+    en essayant chaque moteur de SERP_ENGINES jusqu'a en trouver un qui
+    renvoie au moins un resultat.
+
+    Retourne (resultats, moteur_utilise, diagnostics) :
+    - resultats : liste vide si TOUS les moteurs ont echoue
+    - moteur_utilise : nom du moteur qui a fonctionne, ou None si aucun
+    - diagnostics : un element par moteur essaye (erreur de navigation, ou
+      taille de page + extrait de texte si la page a charge mais 0 resultat
+      parse) — utile pour comprendre un blocage sans acces aux logs serveur
     """
     log = get_logger(request_id)
-    start = time.monotonic()
-    search_url = f"{SERP_SOURCE_URL}?q={quote_plus(query)}"
-    log.info(f"[fetch_serp_results] recherche (navigateur) query={query!r} num_results={num_results}")
-
+    global_start = time.monotonic()
     browser = app.state.browser
-    context, page = await new_hardened_page(browser, block_images=True)
-    try:
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await dismiss_cookie_banner(page)
-        await settle(page)
-        html = await page.content()
-    except Exception as e:
-        duration_ms = (time.monotonic() - start) * 1000
-        log.error(f"[fetch_serp_results] ECHEC navigation query={query!r} apres {duration_ms:.0f}ms : {e}")
-        raise
-    finally:
-        await context.close()
+    diagnostics = []
 
-    results = _parse_serp_html(html, num_results)
-    duration_ms = (time.monotonic() - start) * 1000
+    for engine in SERP_ENGINES:
+        engine_name = engine["name"]
+        search_url = engine["build_url"](query)
+        attempt_start = time.monotonic()
+        log.info(f"[fetch_serp_results] tentative moteur={engine_name} query={query!r}")
 
-    if not results:
+        context, page = await new_hardened_page(browser, block_images=True)
+        html = None
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            await dismiss_cookie_banner(page)
+            await settle(page)
+            html = await page.content()
+        except Exception as e:
+            duration_ms = (time.monotonic() - attempt_start) * 1000
+            log.warning(f"[fetch_serp_results] {engine_name} navigation ECHEC apres {duration_ms:.0f}ms : {e}")
+            diagnostics.append({"engine": engine_name, "error": str(e)})
+        finally:
+            await context.close()
+
+        if html is None:
+            continue
+
+        results = engine["parse"](html, num_results)
+        duration_ms = (time.monotonic() - attempt_start) * 1000
+
+        if results:
+            total_ms = (time.monotonic() - global_start) * 1000
+            log.info(
+                f"[fetch_serp_results] OK via {engine_name} query={query!r} "
+                f"resultats={len(results)} duree_moteur={duration_ms:.0f}ms duree_totale={total_ms:.0f}ms"
+            )
+            return results, engine_name, diagnostics
+
         preview = " ".join(BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True).split())[:300]
         log.warning(
-            f"[fetch_serp_results] AUCUN resultat pour query={query!r} apres {duration_ms:.0f}ms "
-            f"(taille_html={len(html)}) — extrait page recue: {preview!r}"
+            f"[fetch_serp_results] {engine_name} 0 resultat (taille_html={len(html)}) "
+            f"apres {duration_ms:.0f}ms — extrait page recue: {preview!r}"
         )
-    else:
-        log.info(f"[fetch_serp_results] OK query={query!r} resultats={len(results)} duree={duration_ms:.0f}ms")
-    return results
+        diagnostics.append({"engine": engine_name, "html_length": len(html), "preview": preview})
+
+    total_ms = (time.monotonic() - global_start) * 1000
+    log.error(f"[fetch_serp_results] ECHEC TOTAL (tous moteurs : {[e['name'] for e in SERP_ENGINES]}) query={query!r} apres {total_ms:.0f}ms")
+    return [], None, diagnostics
 
 # ─── Analyse texte LLM (Gemini principal, Magistral fallback) ─────────────────
 
@@ -1104,37 +1188,41 @@ async def serp(
     num_results: int = Query(10, ge=1, le=30, description="Nombre de resultats souhaites")
 ):
     """
-    Recherche `query` sur le web (moteur DuckDuckGo, pas de cle API requise)
-    et retourne les resultats bruts (titre, url, extrait), sans analyse LLM.
+    Recherche `query` sur le web (DuckDuckGo -> Bing -> Yandex en fallback,
+    pas de cle API requise) et retourne les resultats bruts (titre, url,
+    extrait), sans analyse LLM.
     """
     app_ = request.app
     request_id = getattr(request.state, "request_id", "-")
     log = get_logger(request_id)
+    engine_names = [e["name"] for e in SERP_ENGINES]
     try:
-        results = await fetch_serp_results(app_, query, num_results, request_id)
+        results, engine_used, diagnostics = await fetch_serp_results(app_, query, num_results, request_id)
         warning = None
         if not results:
             warning = (
-                "Aucun resultat trouve — DuckDuckGo a probablement renvoye une page "
-                "vide/bloquee. Reessayez ; si le probleme persiste, verifiez les logs "
-                "[fetch_serp_results] pour un extrait de la page recue."
+                f"Aucun resultat trouve sur aucun des moteurs essayes ({', '.join(engine_names)}). "
+                "Voir le champ 'diagnostics' ci-dessous pour un extrait de chaque page recue."
             )
-            log.warning(f"[/serp] 0 resultat pour query={query!r}")
+            log.warning(f"[/serp] 0 resultat (tous moteurs) pour query={query!r}")
         history_id = await save_to_history(
-            app_.state.db, SERP_SOURCE_URL, query,
-            json.dumps(results, ensure_ascii=False), mode="serp"
+            app_.state.db, f"serp://{'+'.join(engine_names)}", query,
+            json.dumps({"results": results, "engine": engine_used, "diagnostics": diagnostics}, ensure_ascii=False),
+            mode="serp"
         )
         return {
             "status": "success",
             "id": history_id,
             "query": query,
+            "engine_used": engine_used,
             "count": len(results),
             "results": results,
-            "warning": warning
+            "warning": warning,
+            "diagnostics": diagnostics if not results else None
         }
     except Exception as e:
         log.exception(f"[/serp] echec query={query!r}")
-        await save_to_history(app_.state.db, SERP_SOURCE_URL, query, str(e), status="error", mode="serp")
+        await save_to_history(app_.state.db, f"serp://{'+'.join(engine_names)}", query, str(e), status="error", mode="serp")
         raise HTTPException(status_code=500, detail=f"Erreur SERP : {str(e)}")
 
 @app.get("/serp/analyze")
@@ -1145,9 +1233,10 @@ async def serp_analyze(
     num_results: int = Query(10, ge=1, le=30, description="Nombre de resultats a agreger")
 ):
     """
-    Recherche `query` sur le web puis demande au LLM (meme chaine de fallback
-    que /scrape : Gemini Flash Lite -> Gemini Flash -> Gemma 4 -> Magistral)
-    de repondre a `prompt` en se basant sur les titres/extraits obtenus.
+    Recherche `query` sur le web (DuckDuckGo -> Bing -> Yandex en fallback)
+    puis demande au LLM (meme chaine de fallback que /scrape : Gemini Flash
+    Lite -> Gemini Flash -> Gemma 4 -> Magistral) de repondre a `prompt` en
+    se basant sur les titres/extraits obtenus.
 
     Utile pour des questions ouvertes ne visant pas un site precis, contrairement
     a /scrape (une page connue) ou /agent/search (navigation guidee sur un site).
@@ -1155,17 +1244,18 @@ async def serp_analyze(
     app_ = request.app
     request_id = getattr(request.state, "request_id", "-")
     log = get_logger(request_id)
+    engine_names = [e["name"] for e in SERP_ENGINES]
     loop = asyncio.get_running_loop()
     try:
-        results = await fetch_serp_results(app_, query, num_results, request_id)
+        results, engine_used, diagnostics = await fetch_serp_results(app_, query, num_results, request_id)
         if not results:
-            log.warning(f"[/serp/analyze] aucun resultat pour query={query!r}")
+            log.warning(f"[/serp/analyze] aucun resultat (tous moteurs) pour query={query!r}")
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    "Aucun resultat de recherche trouve — DuckDuckGo a probablement "
-                    "renvoye une page vide/bloquee. Reessayez dans un instant."
-                )
+                detail={
+                    "message": f"Aucun resultat trouve sur aucun des moteurs essayes ({', '.join(engine_names)}).",
+                    "diagnostics": diagnostics
+                }
             )
 
         content = "\n\n".join(
@@ -1175,7 +1265,7 @@ async def serp_analyze(
         answer, model_used = await loop.run_in_executor(executor, run_llm, content, prompt, request_id)
 
         history_id = await save_to_history(
-            app_.state.db, SERP_SOURCE_URL, f"{query} | {prompt}", answer, mode="serp", model=model_used
+            app_.state.db, f"serp://{engine_used}", f"{query} | {prompt}", answer, mode="serp", model=model_used
         )
         return {
             "status": "success",
@@ -1185,13 +1275,14 @@ async def serp_analyze(
             "answer": answer,
             "mode": "serp",
             "model": model_used,
+            "engine_used": engine_used,
             "sources": results
         }
     except HTTPException:
         raise
     except Exception as e:
         log.exception(f"[/serp/analyze] echec query={query!r}")
-        await save_to_history(app_.state.db, SERP_SOURCE_URL, f"{query} | {prompt}", str(e), status="error", mode="serp")
+        await save_to_history(app_.state.db, f"serp://{'+'.join(engine_names)}", f"{query} | {prompt}", str(e), status="error", mode="serp")
         raise HTTPException(status_code=500, detail=f"Erreur SERP : {str(e)}")
 
 # ── Agent navigateur autonome ──
