@@ -294,7 +294,7 @@ API_KEY = os.getenv("API_KEY")
 app = FastAPI(
     title="ScraperWeb V2 API",
     description="API de web scraping IA — Mistral + SQLite + Export + Planification + Agent navigateur",
-    version="2.4.0",
+    version="2.4.1",
     lifespan=lifespan,
 )
 
@@ -472,6 +472,20 @@ async def fetch_page_browser(app: FastAPI, url: str, request_id: str = "-") -> s
 # Reutilisable seul (/serp) ou combine a l'analyse LLM (/serp/analyze) pour
 # repondre a une question en agregant plusieurs resultats de recherche.
 
+# ─── SERP — recherche moteur de recherche ─────────────────────────────────────
+# Recupere les resultats d'une recherche (titre, url, extrait) via le moteur
+# HTML de DuckDuckGo (pas de cle API requise, coherent avec le reste du projet
+# qui evite les dependances a des services payants pour le scraping).
+# Reutilisable seul (/serp) ou combine a l'analyse LLM (/serp/analyze) pour
+# repondre a une question en agregant plusieurs resultats de recherche.
+#
+# IMPORTANT : on passe par le navigateur Playwright persistant (comme
+# fetch_page_browser), PAS par `requests`. DuckDuckGo bloque tres agressivement
+# les requetes HTTP brutes venant d'IP de datacenter (Render/Railway/etc.) —
+# la reponse revient "200 OK" mais vide/tronquee, donc l'echec est silencieux
+# avec `requests`. Le navigateur (vrai user-agent, JS, cookies) contourne
+# nettement mieux ce blocage.
+
 SERP_SOURCE_URL = "https://html.duckduckgo.com/html/"
 
 
@@ -488,49 +502,67 @@ def _unwrap_ddg_url(href: str) -> str:
     return href
 
 
-def fetch_serp_results(query: str, num_results: int = 10, request_id: str = "-") -> list[dict]:
+def _parse_serp_html(html: str, num_results: int) -> list[dict]:
+    """Extrait titre/url/extrait des resultats a partir du HTML DuckDuckGo."""
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    # Selecteur principal (version "html.duckduckgo.com/html/")
+    result_divs = soup.select("div.result") or soup.select("div.web-result")
+    for result_div in result_divs:
+        link_tag = (
+            result_div.select_one("a.result__a")
+            or result_div.select_one("a.result__url")
+            or result_div.select_one("h2 a")
+        )
+        if not link_tag:
+            continue
+        title = link_tag.get_text(strip=True)
+        href = _unwrap_ddg_url(link_tag.get("href", ""))
+        snippet_tag = result_div.select_one(".result__snippet")
+        snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+        if title and href:
+            results.append({"title": title, "url": href, "snippet": snippet})
+        if len(results) >= num_results:
+            break
+    return results
+
+
+async def fetch_serp_results(app: FastAPI, query: str, num_results: int = 10, request_id: str = "-") -> list[dict]:
     """
-    Recupere les resultats de recherche (titre, url, extrait) pour `query`.
-    Synchrone (executor), meme pattern que fetch_page_content.
+    Recupere les resultats de recherche (titre, url, extrait) pour `query`
+    via le navigateur Playwright persistant (app.state.browser).
     """
     log = get_logger(request_id)
     start = time.monotonic()
-    log.info(f"[fetch_serp_results] recherche query={query!r} num_results={num_results}")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; ScraperWebBot/2.0)",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+    search_url = f"{SERP_SOURCE_URL}?q={quote_plus(query)}"
+    log.info(f"[fetch_serp_results] recherche (navigateur) query={query!r} num_results={num_results}")
+
+    browser = app.state.browser
+    context, page = await new_hardened_page(browser, block_images=True)
     try:
-        response = http_requests.post(
-            SERP_SOURCE_URL, data={"q": query}, headers=headers, timeout=15
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        results = []
-        for result_div in soup.select("div.result"):
-            link_tag = result_div.select_one("a.result__a")
-            if not link_tag:
-                continue
-            title = link_tag.get_text(strip=True)
-            href = _unwrap_ddg_url(link_tag.get("href", ""))
-            snippet_tag = result_div.select_one(".result__snippet")
-            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
-            if title and href:
-                results.append({"title": title, "url": href, "snippet": snippet})
-            if len(results) >= num_results:
-                break
-
-        duration_ms = (time.monotonic() - start) * 1000
-        if not results:
-            log.warning(f"[fetch_serp_results] AUCUN resultat pour query={query!r} (duree={duration_ms:.0f}ms) — page bloquee/format modifie ?")
-        else:
-            log.info(f"[fetch_serp_results] OK query={query!r} resultats={len(results)} duree={duration_ms:.0f}ms")
-        return results
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await dismiss_cookie_banner(page)
+        await settle(page)
+        html = await page.content()
     except Exception as e:
         duration_ms = (time.monotonic() - start) * 1000
-        log.error(f"[fetch_serp_results] ECHEC query={query!r} apres {duration_ms:.0f}ms : {e}")
+        log.error(f"[fetch_serp_results] ECHEC navigation query={query!r} apres {duration_ms:.0f}ms : {e}")
         raise
+    finally:
+        await context.close()
+
+    results = _parse_serp_html(html, num_results)
+    duration_ms = (time.monotonic() - start) * 1000
+
+    if not results:
+        preview = " ".join(BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True).split())[:300]
+        log.warning(
+            f"[fetch_serp_results] AUCUN resultat pour query={query!r} apres {duration_ms:.0f}ms "
+            f"(taille_html={len(html)}) — extrait page recue: {preview!r}"
+        )
+    else:
+        log.info(f"[fetch_serp_results] OK query={query!r} resultats={len(results)} duree={duration_ms:.0f}ms")
+    return results
 
 # ─── Analyse texte LLM (Gemini principal, Magistral fallback) ─────────────────
 
@@ -1078,9 +1110,16 @@ async def serp(
     app_ = request.app
     request_id = getattr(request.state, "request_id", "-")
     log = get_logger(request_id)
-    loop = asyncio.get_running_loop()
     try:
-        results = await loop.run_in_executor(executor, fetch_serp_results, query, num_results, request_id)
+        results = await fetch_serp_results(app_, query, num_results, request_id)
+        warning = None
+        if not results:
+            warning = (
+                "Aucun resultat trouve — DuckDuckGo a probablement renvoye une page "
+                "vide/bloquee. Reessayez ; si le probleme persiste, verifiez les logs "
+                "[fetch_serp_results] pour un extrait de la page recue."
+            )
+            log.warning(f"[/serp] 0 resultat pour query={query!r}")
         history_id = await save_to_history(
             app_.state.db, SERP_SOURCE_URL, query,
             json.dumps(results, ensure_ascii=False), mode="serp"
@@ -1090,7 +1129,8 @@ async def serp(
             "id": history_id,
             "query": query,
             "count": len(results),
-            "results": results
+            "results": results,
+            "warning": warning
         }
     except Exception as e:
         log.exception(f"[/serp] echec query={query!r}")
@@ -1117,10 +1157,16 @@ async def serp_analyze(
     log = get_logger(request_id)
     loop = asyncio.get_running_loop()
     try:
-        results = await loop.run_in_executor(executor, fetch_serp_results, query, num_results, request_id)
+        results = await fetch_serp_results(app_, query, num_results, request_id)
         if not results:
             log.warning(f"[/serp/analyze] aucun resultat pour query={query!r}")
-            raise HTTPException(status_code=404, detail="Aucun resultat de recherche trouve")
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Aucun resultat de recherche trouve — DuckDuckGo a probablement "
+                    "renvoye une page vide/bloquee. Reessayez dans un instant."
+                )
+            )
 
         content = "\n\n".join(
             f"[{i+1}] {r['title']}\n{r['url']}\n{r['snippet']}"
